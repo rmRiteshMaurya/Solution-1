@@ -18,10 +18,12 @@ global class StaleLeadBatch implements
         batchSize = size;
     }
 
+// ---------------- START ----------------
     global Database.QueryLocator start(Database.BatchableContext bc) {
         return Database.getQueryLocator([SELECT Id, Email, Industry, Company, Status FROM Lead WHERE CreatedDate <= :System.today().addDays(-90)]);
     }
 
+// ---------------- EXECUTE ----------------
     global void execute(
         Database.BatchableContext bc,
         List<Lead> scope
@@ -99,6 +101,7 @@ global class StaleLeadBatch implements
         }
     }
 
+// ---------------- FINISH ----------------
     global void finish(Database.BatchableContext bc) {
 
         Messaging.SingleEmailMessage email =
