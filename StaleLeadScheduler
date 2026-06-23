@@ -1,10 +1,7 @@
-global class StaleLeadScheduler implements Schedulable {
-    global void execute(
-        SchedulableContext sc
-    ) {
-        Database.executeBatch(
-            new StaleLeadBatch(200),
-            200
-        );
+public class StaleLeadProcessingScheduler implements Schedulable {
+
+    public void execute(SchedulableContext sc) {
+        StaleLeadProcessingBatch batch = new StaleLeadProcessingBatch(200);
+        Database.executeBatch(batch, 200);
     }
 }
