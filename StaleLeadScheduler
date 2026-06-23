@@ -1,0 +1,10 @@
+global class StaleLeadScheduler implements Schedulable {
+    global void execute(
+        SchedulableContext sc
+    ) {
+        Database.executeBatch(
+            new StaleLeadBatch(200),
+            200
+        );
+    }
+}
