@@ -1,145 +1,160 @@
-global class StaleLeadBatch implements
-    Database.Batchable<SObject>,
-    Database.Stateful {
+public class StaleLeadProcessingBatch implements Database.Batchable<SObject>, Database.Stateful {
 
-    global Integer totalProcessed = 0;
-    global Integer totalConverted = 0;
-    global Integer totalDisqualified = 0;
+    // Configurable batch size, default 200
+    public Integer batchSize = 200;
 
-    global List<String> failures = new List<String>();
+    // Stateful tracking variables
+    public Integer totalProcessed = 0;
+    public Integer totalConverted = 0;
+    public Integer totalDisqualified = 0;
+    public List<String> failedRecords = new List<String>();
 
-    private Integer batchSize;
-
-    public StaleLeadBatch() {
-        batchSize = 200;
+    // Constructor - default batch size
+    public StaleLeadProcessingBatch() {
+        this.batchSize = 200;
     }
 
-    public StaleLeadBatch(Integer size) {
-        batchSize = size;
+    // Constructor - configurable batch size
+    public StaleLeadProcessingBatch(Integer batchSize) {
+        this.batchSize = batchSize != null && batchSize > 0 ? batchSize : 200;
     }
 
-// ---------------- START ----------------
-    global Database.QueryLocator start(Database.BatchableContext bc) {
-        return Database.getQueryLocator([SELECT Id, Email, Industry, Company, Status FROM Lead WHERE CreatedDate <= :System.today().addDays(-90)]);
+    // ---------------- START ----------------
+    public Database.QueryLocator start(Database.BatchableContext bc) {
+        DateTime ninetyDaysAgo = DateTime.now().addDays(-90);
+
+        String query = 'SELECT Id, Email, Company, Industry, Status, ' +
+                        'CreatedDate, LastActivityDate, IsConverted ' +
+                        'FROM Lead ' +
+                        'WHERE IsConverted = false ' +
+                        'AND CreatedDate <= :ninetyDaysAgo ' +
+                        'AND LastActivityDate = null';
+
+        return Database.getQueryLocator(query);
     }
 
-// ---------------- EXECUTE ----------------
-    global void execute(
-        Database.BatchableContext bc,
-        List<Lead> scope
-    ) {
+    // ---------------- EXECUTE ----------------
+    public void execute(Database.BatchableContext bc, List<Lead> scope) {
 
-        Set<String> industries = new Set<String>();
+        // Free email domains - everything else treated as "corporate"
+        Set<String> freeDomains = new Set<String>{
+            'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com'
+        };
 
-        for(Lead_Industry_Config__mdt rule :
-            [SELECT Industry_Name__c FROM Lead_Industry_Config__mdt]) {
-
-            industries.add(rule.Industry_Name__c);
+        // Load valid industries from Custom Metadata
+        Set<String> validIndustries = new Set<String>();
+        for (Lead_Industry_Config__mdt cfg : Lead_Industry_Config__mdt.getAll().values()) {
+            if (cfg.Industry_Name__c != null) {
+                validIndustries.add(cfg.Industry_Name__c.trim().toLowerCase());
+            }
         }
 
-        List<Database.LeadConvert> converts =
-            new List<Database.LeadConvert>();
+        List<Lead> leadsToConvert = new List<Lead>();
+        List<Database.LeadConvert> leadConverts = new List<Database.LeadConvert>();
+        List<Lead> leadsToDisqualify = new List<Lead>();
 
-        List<Lead> disqualified =
-            new List<Lead>();
+        // Default lead status for conversion (org-specific - adjust as needed)
+        LeadStatus convertedStatus = [
+            SELECT MasterLabel FROM LeadStatus WHERE IsConverted = true LIMIT 1
+        ];
 
-        for(Lead l : scope) {
+        for (Lead ld : scope) {
+            totalProcessed++;
             Integer score = 0;
 
-            if(l.Email != null &&
-               !l.Email.contains('gmail.com') &&
-               !l.Email.contains('yahoo.com')) {
-                score += 10;
+            // Rule 1: Corporate email domain
+            if (String.isNotBlank(ld.Email) && ld.Email.contains('@')) {
+                String domain = ld.Email.substringAfter('@').toLowerCase();
+                if (!freeDomains.contains(domain)) {
+                    score += 10;
+                }
             }
 
-            if(l.Company != null) {
+            // Rule 2: Industry exists in Custom Metadata
+            if (String.isNotBlank(ld.Industry) &&
+                validIndustries.contains(ld.Industry.trim().toLowerCase())) {
+                score += 20;
+            }
+
+            // Rule 3: Company populated
+            if (String.isNotBlank(ld.Company)) {
                 score += 15;
             }
 
-            if(industries.contains(l.Industry)) {
-                score += 20;
-            }
-            totalProcessed++;
-
-            if(score > 30) {
-                Database.LeadConvert lc =
-                    new Database.LeadConvert();
-
-                lc.setLeadId(l.Id);
-
-                lc.setConvertedStatus(
-                    'Closed - Converted'
-                );
-                converts.add(lc);
+            // Decision logic
+            if (score >= 30) {
+                Database.LeadConvert lc = new Database.LeadConvert();
+                lc.setLeadId(ld.Id);
+                lc.setConvertedStatus(convertedStatus.MasterLabel);
+                lc.setDoNotCreateOpportunity(false);
+                leadConverts.add(lc);
             } else {
-                l.Status = 'Disqualified';
-                disqualified.add(l);
-                totalDisqualified++;
+                ld.Status = 'Disqualified';
+                leadsToDisqualify.add(ld);
             }
         }
 
-        if(!disqualified.isEmpty()) {
-            update disqualified;
-        }
+        // Convert qualifying leads
+        if (!leadConverts.isEmpty()) {
+            List<Database.LeadConvertResult> convertResults =
+                Database.convertLead(leadConverts, false);
 
-        if(!converts.isEmpty()) {
-            List<Database.LeadConvertResult> results =
-                Database.convertLead(converts,false);
-
-            for(Database.LeadConvertResult r : results) {
-                if(r.isSuccess()) {
+            for (Integer i = 0; i < convertResults.size(); i++) {
+                Database.LeadConvertResult res = convertResults[i];
+                if (res.isSuccess()) {
                     totalConverted++;
                 } else {
-                    for(Database.Error e :
-                        r.getErrors()) {
-                        failures.add(
-                            e.getMessage()
-                        );
-                    }
+                    failedRecords.add('LeadConvert [' + leadConverts[i].getLeadId() + ']: ' +
+                                       res.getErrors()[0].getMessage());
+                }
+            }
+        }
+
+        // Disqualify non-qualifying leads
+        if (!leadsToDisqualify.isEmpty()) {
+            List<Database.SaveResult> saveResults =
+                Database.update(leadsToDisqualify, false);
+
+            for (Integer i = 0; i < saveResults.size(); i++) {
+                Database.SaveResult res = saveResults[i];
+                if (res.isSuccess()) {
+                    totalDisqualified++;
+                } else {
+                    failedRecords.add('LeadUpdate [' + leadsToDisqualify[i].Id + ']: ' +
+                                       res.getErrors()[0].getMessage());
                 }
             }
         }
     }
 
-// ---------------- FINISH ----------------
-    global void finish(Database.BatchableContext bc) {
+    // ---------------- FINISH ----------------
+    public void finish(Database.BatchableContext bc) {
 
-        Messaging.SingleEmailMessage email =
-            new Messaging.SingleEmailMessage();
+        AsyncApexJob job = [
+            SELECT Id, Status, NumberOfErrors, JobItemsProcessed,
+                   TotalJobItems, CreatedBy.Email
+            FROM AsyncApexJob
+            WHERE Id = :bc.getJobId()
+        ];
 
-        email.setToAddresses(
-            new String[]{
-                UserInfo.getUserEmail()
-            }
-        );
+        String body = 'Stale Lead Processing Engine - Batch Summary\n\n';
+        body += 'Total Leads Processed   : ' + totalProcessed + '\n';
+        body += 'Total Leads Converted    : ' + totalConverted + '\n';
+        body += 'Total Leads Disqualified : ' + totalDisqualified + '\n';
+        body += 'Total Failures           : ' + failedRecords.size() + '\n\n';
 
-        String body =
-            'Lead Processing Summary\n\n' +
-            'Processed : ' + totalProcessed + '\n' +
-            'Converted : ' + totalConverted + '\n' +
-            'Disqualified : ' + totalDisqualified + '\n\n';
-
-        if(!failures.isEmpty()) {
-            body += 'Failures:\n';
-            for(String f : failures) {
-                body += f + '\n';
+        if (!failedRecords.isEmpty()) {
+            body += 'Failure Details:\n';
+            for (String err : failedRecords) {
+                body += '- ' + err + '\n';
             }
         }
 
-        email.setSubject(
-            'Stale Lead Batch Summary'
-        );
+        Messaging.SingleEmailMessage mail = new Messaging.SingleEmailMessage();
+        mail.setToAddresses(new String[] { job.CreatedBy.Email });
+        mail.setSubject('Stale Lead Batch Job Summary - ' + Date.today().format());
+        mail.setPlainTextBody(body);
 
-        email.setPlainTextBody(body);
-
-        Messaging.sendEmail(
-            new Messaging.SingleEmailMessage[]{
-                email
-            }
-        );
-    }
-
-    public Integer getBatchSize() {
-        return batchSize;
+        Messaging.sendEmail(new Messaging.SingleEmailMessage[] { mail });
     }
 }
