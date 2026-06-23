@@ -1,0 +1,85 @@
+@IsTest
+private class StaleLeadBatchTest {
+
+    @TestSetup
+    static void setupData() {
+
+        List<Lead> leads = new List<Lead>();
+
+        leads.add(new Lead(
+            LastName = 'Convert Lead',
+            Company = 'Acme Corp',
+            Email = 'john@acme.com',
+            Industry = 'Healthcare',
+            Status = 'Open - Not Contacted'
+        ));
+
+        leads.add(new Lead(
+            LastName = 'Disqualify Lead',
+            Company = 'Test Company',
+            Email = 'test@gmail.com',
+            Industry = 'Other',
+            Status = 'Open - Not Contacted'
+        ));
+
+        insert leads;
+
+        DateTime oldDate = System.now().addDays(-100);
+
+        for (Lead l : leads) {
+            Test.setCreatedDate(l.Id, oldDate);
+        }
+    }
+
+    @IsTest
+    static void testBatchExecution() {
+
+        Test.startTest();
+
+        StaleLeadBatch batch = new StaleLeadBatch(200);
+
+        Database.executeBatch(batch, 200);
+
+        Test.stopTest();
+    }
+
+    @IsTest
+    static void testDefaultConstructor() {
+
+        StaleLeadBatch batch = new StaleLeadBatch();
+
+        batch.getBatchSize();
+    }
+
+    @IsTest
+    static void testParameterizedConstructor() {
+
+        StaleLeadBatch batch = new StaleLeadBatch(100);
+
+        batch.getBatchSize();
+    }
+
+    @IsTest
+    static void testStartMethod() {
+
+        StaleLeadBatch batch = new StaleLeadBatch();
+
+        Test.startTest();
+
+        batch.start(null);
+
+        Test.stopTest();
+    }
+
+    @IsTest
+    static void testFinishMethod() {
+
+        StaleLeadBatch batch = new StaleLeadBatch();
+
+        Test.startTest();
+
+        batch.finish(null);
+
+        Test.stopTest();
+    }
+}
